@@ -1,0 +1,263 @@
+## inanna/discover.sls
+#
+# Purpose:
+#   1) On this host: collect OS info, installed pkgs, upgradable pkgs, running services.
+#   2) On the network: scan one or more CIDRs to find alive hosts (minion or not) and
+#      optionally probe key ports (SSH/WinRM/RDP) to identify agentless candidates.
+#   3) Write reports into /var/log/inanna for later collection/correlation.
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt '*' state.apply inanna.discover
+#
+# Pillar (examples):
+# inanna:
+#   discovery:
+#     scan_ranges:
+#       - '192.168.2.0/24'
+#       - '192.168.3.0/24'
+#     install_nmap: true
+#     probe_ports: true
+#     port_list: [22, 5985, 3389]
+#     overwrite_reports: false
+#     paths:
+#       log_dir: /var/log/inanna
+#   # Legacy keys (still supported): overwrite_discovery, scan_range, discover_install_nmap, probe_ports, probe_port_list
+#
+# Notes:
+#   - Keeps dual-scan (ICMP + management TCP) to handle ICMP-blocked hosts.
+#   - Creates timestamped outputs and a stable *_latest symlink.
+#   - Package upgrade count supports both dnf (RHEL) and apt (Debian/Ubuntu).
+
+{# --- Canonical pillar with fallbacks (do not remove fallbacks until all pillars migrated) --- #}
+{% set inanna            = salt['pillar.get']('inanna', {}) %}
+{% set disc              = inanna.get('discovery', {}) %}
+{% set scan_ranges       = disc.get('scan_ranges', salt['pillar.get']('inanna:scan_range', [])) %}
+{% set install_nmap      = disc.get('install_nmap', salt['pillar.get']('inanna:discover_install_nmap', True)) %}
+{% set probe_ports       = disc.get('probe_ports', salt['pillar.get']('inanna:probe_ports', True)) %}
+{% set port_list         = disc.get('port_list',  salt['pillar.get']('inanna:probe_port_list', [22, 5985, 3389])) %}
+{% set overwrite_reports = disc.get('overwrite_reports', salt['pillar.get']('inanna:overwrite_discovery', False)) %}
+{% set paths             = disc.get('paths', {}) %}
+{% set log_dir           = paths.get('log_dir', '/var/log/inanna') %}
+{% set DRY               = inanna.get('dry_run', False) %}
+{% set safety            = inanna.get('safety', {}) %}
+{% set ENFORCE_TYPES     = safety.get('enforce_types', True) %}
+
+{# --- Basic variables --- #}
+{% set hostname      = grains['id'] %}
+{% set ts            = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set ping_file     = log_dir ~ '/inanna_alive_icmp_' ~ hostname ~ '_' ~ ts ~ '.txt' %}
+{% set tcp_file      = log_dir ~ '/inanna_alive_mgmt_' ~ hostname ~ '_' ~ ts ~ '.txt' %}
+{% set combined_file = log_dir ~ '/inanna_alive_combined_' ~ hostname ~ '_' ~ ts ~ '.txt' %}
+{% set ping_latest   = log_dir ~ '/inanna_alive_icmp_latest.txt' %}
+{% set tcp_latest    = log_dir ~ '/inanna_alive_mgmt_latest.txt' %}
+{% set comb_latest   = log_dir ~ '/inanna_alive_combined_latest.txt' %}
+{% set report_file   = log_dir ~ '/inanna_discover_' ~ hostname ~ '_' ~ ts ~ '.txt' %}
+{% set report_latest = log_dir ~ '/inanna_discover_latest.txt' %}
+{% set probe_ports_str = (port_list | join(',')) %}
+
+{# --- Optional type checks --- #}
+{% if ENFORCE_TYPES and (scan_ranges is string or (scan_ranges is not iterable)) %}
+{{ salt['test.fail_without_changes']('pillar inanna.discovery.scan_ranges must be a list (e.g., ["10.0.0.0/24"])') }}
+{% endif %}
+
+{# --- Ensure log directory --- #}
+inanna-discover-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - mode: '0750'
+    - user: root
+    - group: root
+    - makedirs: True
+
+{# --- Optionally ensure nmap is present --- #}
+{% if scan_ranges %}
+  {% if install_nmap %}
+inanna-discover-nmap:
+  pkg.installed:
+    - name: nmap
+  {% else %}
+inanna-discover-nmap-warn:
+  cmd.run:
+    - name: "command -v nmap >/dev/null 2>&1 || echo 'WARNING: nmap not found; network discovery will be skipped'"
+    - shell: /bin/bash
+  {% endif %}
+{% endif %}
+
+{# ----------------------------- Local inventory ----------------------------- #}
+
+collect_grains:
+  module.run:
+    - name: grains.items
+
+list_installed_packages:
+  module.run:
+    - name: pkg.list_pkgs
+
+list_upgradable_packages:
+  module.run:
+    - name: pkg.list_upgrades
+
+write_host_report:
+  cmd.run:
+    - name: |
+        {
+          echo "===== Inanna Discovery Report ====="
+          echo "Host: {{ hostname }}"
+          echo "Timestamp: $(date +'%Y-%m-%d %H:%M:%S')"
+          echo
+          echo "--- OS Info ---"
+          cat /etc/os-release 2>/dev/null || true
+          echo
+          echo "--- Kernel Info ---"
+          uname -a
+          echo
+          echo "--- Upgradeable Packages ---"
+          if command -v dnf >/dev/null 2>&1; then
+            dnf check-update >/tmp/inanna_chkupd_{{ hostname }}.txt 2>&1 || test $? -eq 100
+            awk 'NF && $1 !~ /^(Last|Obsoleting|Security|Upgraded)/ {c++} END{print "Packages needing update:", (c+0)}' /tmp/inanna_chkupd_{{ hostname }}.txt
+          elif command -v apt-get >/dev/null 2>&1; then
+            apt-get -s upgrade 2>/dev/null | awk '/^Inst /{c++} END{print "Packages needing update:", (c+0)}'
+          else
+            echo "Unknown package manager; skipping detailed count"
+          fi
+          echo
+          echo "--- Installed Packages ---"
+          if command -v rpm >/dev/null 2>&1; then rpm -qa | sort; elif command -v dpkg >/dev/null 2>&1; then dpkg -l; else echo "No RPM/DPKG database found"; fi
+          echo
+          echo "--- Running Services ---"
+          systemctl list-units --type=service --state=running --no-pager --no-legend 2>/dev/null || true
+        } > {{ report_file }}
+    - shell: /bin/bash
+    - unless: {{ 'test -f ' ~ report_file if not overwrite_reports else 'false' }}
+    - require:
+      - file: inanna-discover-logdir
+      - module: collect_grains
+      - module: list_installed_packages
+      - module: list_upgradable_packages
+
+inanna-discover-report-latest:
+  file.symlink:
+    - name: {{ report_latest }}
+    - target: {{ report_file }}
+    - force: True
+    - require:
+      - cmd: write_host_report
+
+{# ----------------------------- Network discovery (ICMP + TCP) ----------------------------- #}
+{% if scan_ranges %}
+
+discover_alive_icmp:
+  cmd.run:
+    - name: |
+        {
+          echo "===== Inanna Network Discovery (ICMP) ====="
+          echo "Scanner Host: {{ hostname }}"
+          echo "Timestamp: $(date +'%Y-%m-%d %H:%M:%S')"
+          echo
+          echo "--- Ranges ---"
+          {% for cidr in scan_ranges %}
+          echo "{{ cidr }}"
+          {% endfor %}
+          echo
+          echo "--- Alive Hosts (by ICMP) ---"
+          {% for cidr in scan_ranges %}
+          nmap -sn -n {{ cidr }} -oG - 2>/dev/null | awk '/Up$/{print $2}'
+          {% endfor %}
+        } > {{ ping_file }}
+    - shell: /bin/bash
+    - unless: {{ 'test -f ' ~ ping_file if not overwrite_reports else 'false' }}
+    - require:
+      - file: inanna-discover-logdir
+      {% if install_nmap %}
+      - pkg: inanna-discover-nmap
+      {% else %}
+      - cmd: inanna-discover-nmap-warn
+      {% endif %}
+
+inanna-discover-icmp-latest:
+  file.symlink:
+    - name: {{ ping_latest }}
+    - target: {{ ping_file }}
+    - force: True
+    - require:
+      - cmd: discover_alive_icmp
+
+{% if probe_ports %}
+discover_alive_mgmt_tcp:
+  cmd.run:
+    - name: |
+        {
+          echo "===== Inanna Network Discovery (Mgmt TCP) ====="
+          echo "Scanner Host: {{ hostname }}"
+          echo "Timestamp: $(date +'%Y-%m-%d %H:%M:%S')"
+          echo "Probed Ports: {{ probe_ports_str }}"
+          echo
+          echo "--- Alive Hosts (by management TCP ports) ---"
+          {% for cidr in scan_ranges %}
+          nmap -n -Pn -p {{ probe_ports_str }} --open {{ cidr }} -oG - 2>/dev/null \
+            | awk '/Ports:/{print $2}'
+          {% endfor %}
+        } > {{ tcp_file }}
+    - shell: /bin/bash
+    - unless: {{ 'test -f ' ~ tcp_file if not overwrite_reports else 'false' }}
+    - require:
+      - file: inanna-discover-logdir
+      - cmd: discover_alive_icmp
+      {% if install_nmap %}
+      - pkg: inanna-discover-nmap
+      {% else %}
+      - cmd: inanna-discover-nmap-warn
+      {% endif %}
+
+inanna-discover-mgmt-latest:
+  file.symlink:
+    - name: {{ tcp_latest }}
+    - target: {{ tcp_file }}
+    - force: True
+    - require:
+      - cmd: discover_alive_mgmt_tcp
+{% endif %}
+
+combine_alive_lists:
+  cmd.run:
+    - name: |
+        {
+          echo "===== Inanna Combined Alive Hosts ====="
+          echo "Scanner Host: {{ hostname }}"
+          echo "Timestamp: $(date +'%Y-%m-%d %H:%M:%S')"
+          echo
+          echo "--- ICMP Alive ---"
+          awk '/^--- Alive Hosts \(by ICMP\) ---/{flag=1;next} /^$/{if(flag)exit} flag && /^[0-9]/{print}' {{ ping_file }} 2>/dev/null || true
+          echo
+          echo "--- Mgmt TCP Alive ---"
+          {% if probe_ports %}
+          awk '/^--- Alive Hosts \(by management TCP ports\) ---/{flag=1;next} /^$/{if(flag)exit} flag && /^[0-9]/{print}' {{ tcp_file }} 2>/dev/null || true
+          {% else %}
+          echo "(TCP probe disabled)"
+          {% endif %}
+          echo
+          echo "--- Union (unique) ---"
+          { awk '/^--- Alive Hosts \(by ICMP\) ---/{f=1;next} /^$/{if(f)f=0} f && /^[0-9]/{print} ' {{ ping_file }} 2>/dev/null; \
+            {% if probe_ports %} awk '/^--- Alive Hosts \(by management TCP ports\) ---/{f=1;next} /^$/{if(f)f=0} f && /^[0-9]/{print} ' {{ tcp_file }} 2>/dev/null; {% endif %} } \
+            | sort -u
+        } > {{ combined_file }}
+    - shell: /bin/bash
+    - unless: {{ 'test -f ' ~ combined_file if not overwrite_reports else 'false' }}
+    - require:
+      - cmd: discover_alive_icmp
+      {% if probe_ports %}
+      - cmd: discover_alive_mgmt_tcp
+      {% endif %}
+
+inanna-discover-combined-latest:
+  file.symlink:
+    - name: {{ comb_latest }}
+    - target: {{ combined_file }}
+    - force: True
+    - require:
+      - cmd: combine_alive_lists
+
+{% endif %}

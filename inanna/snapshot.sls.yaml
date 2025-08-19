@@ -1,0 +1,130 @@
+## inanna/snapshot.sls
+#
+# Purpose:
+#   Create VM snapshots on ESXi/vCenter for rollback before patching.
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt-run state.orch inanna.snapshot
+#
+# Notes:
+#   - Ensures that inanna.skip_snapshot is actioned even when called directly.
+#   - Credentials are read from pillar (do NOT commit real secrets).
+#   - Snapshot flags are configurable under inanna.snapshot.
+
+{# --------------------------- Pillar & settings --------------------------- #}
+{% set inanna       = salt['pillar.get']('inanna', {}) %}
+{% set vmw          = inanna.get('vmware', {}) %}
+{% set vm_names     = inanna.get('vm_names', []) %}
+{% set snap_cfg     = inanna.get('snapshot', {}) %}
+{% set DRY          = inanna.get('dry_run', False) %}
+{% set SKIP         = inanna.get('skip_snapshot', False) %}
+
+{# Defaults & paths -------------------------------------------------------- #}
+{% set name_prefix  = snap_cfg.get('name_prefix', 'inanna_prepatch_') %}
+{% set memory_flag  = snap_cfg.get('memory', True) %}
+{% set quiesce_flag = snap_cfg.get('quiesce', True) %}
+{% set log_dir      = inanna.get('discovery', {}).get('paths', {}).get('log_dir', '/var/log/inanna') %}
+{% set ts           = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set snapshot_name = name_prefix ~ ts %}
+{% set log_file     = log_dir ~ '/snapshot_' ~ ts ~ '.log' %}
+{% set log_latest   = log_dir ~ '/snapshot_latest.log' %}
+
+{# Safety rails ------------------------------------------------------------ #}
+{% set ENFORCE      = inanna.get('safety', {}).get('enforce_types', True) %}
+{% if ENFORCE and (vm_names is string or (vm_names is not iterable)) %}
+{{ salt['test.fail_without_changes']('pillar inanna.vm_names must be a list of VM inventory names') }}
+{% endif %}
+
+{# Skip handling ----------------------------------------------------------- #}
+{% if SKIP %}
+inanna-snapshot-skip:
+  test.nop:
+    - comment: "Snapshots skipped by pillar: inanna.skip_snapshot=true"
+{% else %}
+
+{# Ensure log dir ---------------------------------------------------------- #}
+inanna-snapshot-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - user: root
+    - group: root
+    - mode: '0750'
+    - makedirs: True
+
+{# Basic sanity on creds (fail-fast without revealing secrets) ------------- #}
+{% for req_key in ['host','user','password','protocol','port'] %}
+  {% if not vmw.get(req_key) %}
+inanna-snapshot-missing-{{ req_key }}:
+  test.fail_without_changes:
+    - name: "Missing required pillar: inanna.vmware.{{ req_key }}"
+    - require:
+      - file: inanna-snapshot-logdir
+  {% endif %}
+{% endfor %}
+
+{# Snapshot creation per VM ------------------------------------------------ #}
+{% if vm_names %}
+  {% for vm in vm_names %}
+inanna-snapshot-{{ vm|replace(' ', '_') }}:
+  module.run:
+    - name: vmware.vm_snapshot_create
+    - m_name: {{ vm }}
+    - snapshot_name: {{ snapshot_name }}
+    - description: "Inanna automated pre-patch snapshot ({{ ts }})"
+    - memory: {{ memory_flag }}
+    - quiesce: {{ quiesce_flag }}
+    - hostname: {{ vmw.get('host') | tojson }}
+    - username: {{ vmw.get('user') | tojson }}
+    - password: {{ vmw.get('password') | tojson }}
+    - protocol: {{ vmw.get('protocol') | tojson }}
+    - port: {{ vmw.get('port') }}
+    - test: {{ DRY }}
+    - require:
+      - file: inanna-snapshot-logdir
+  {% endfor %}
+{% else %}
+inanna-snapshot-no-vms:
+  test.succeed_without_changes:
+    - name: "No VMs listed under pillar inanna.vm_names — nothing to snapshot."
+    - require:
+      - file: inanna-snapshot-logdir
+{% endif %}
+
+{# Write a simple run log (no secrets) ------------------------------------ #}
+{% set vm_lines = [] %}
+{% for vm in vm_names %}{% do vm_lines.append(' - ' ~ vm) %}{% endfor %}
+{% set log_text = [
+  'Snapshot name: ' ~ snapshot_name,
+  'Timestamp: ' ~ ts,
+  'VM count: ' ~ (vm_names|length)|string,
+  'VMs:',
+  vm_lines|join('\n')
+]|join('\n') ~ '\n' %}
+
+inanna-snapshot-log:
+  file.managed:
+    - name: {{ log_file }}
+    - user: root
+    - group: root
+    - mode: '0640'
+    - contents: |
+{{ log_text|indent(6, True) }}
+    - require:
+      {% if vm_names %}
+      - module: inanna-snapshot-{{ vm_names[-1]|replace(' ', '_') }}
+      {% else %}
+      - test: inanna-snapshot-no-vms
+      {% endif %}
+
+inanna-snapshot-log-latest:
+  file.symlink:
+    - name: {{ log_latest }}
+    - target: {{ log_file }}
+    - force: True
+    - require:
+      - file: inanna-snapshot-log
+
+{% endif %}

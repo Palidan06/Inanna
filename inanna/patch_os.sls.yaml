@@ -1,0 +1,162 @@
+## inanna/patch_os.sls
+#
+# Purpose:
+#   Apply operating system updates based on strategy defined in pillar.
+#   Supports full updates or security-only patching, with host exclusion/whitelist,
+#   dry-run (via test=True), and logging.
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt '*' state.apply inanna.patch_os
+#
+# Pillar (canonical with legacy fallbacks):
+#   inanna:
+#     dry_run: true|false
+#     update_mode: 'security'|'all'      # preferred
+#     os_update_mode: 'security'|'all'   # legacy; used if update_mode missing
+#     targeting:
+#       whitelist: [host/ip,...]         # optional: only patch these if non-empty
+#       blacklist: [host/ip,...]         # never patch these
+#     cleanup:
+#       retention_days: 30
+#     safety:
+#       enforce_types: true
+#     discovery:
+#       paths:
+#         log_dir: /var/log/inanna
+#
+# Notes:
+#   - Snapshot gating is handled in inanna/init.sls (discover → snapshot → patch_os).
+#   - For RHEL-family, security-only uses yum/dnf security advisories.
+#   - For Debian/Ubuntu, native "security-only" is non-trivial; we log a note and run standard updates.
+#   - Run with `test=True` (set by init.sls) to see what would change.
+
+{# ----------------------------- Pillar & vars ----------------------------- #}
+{% set ina        = salt['pillar.get']('inanna', {}) %}
+{% set DRY        = ina.get('dry_run', False) %}
+{% set safety     = ina.get('safety', {}) %}
+{% set ENFORCE    = safety.get('enforce_types', True) %}
+
+{# update mode: prefer update_mode; fallback to os_update_mode; default 'security' in prod #}
+{% set update_mode = ina.get('update_mode', ina.get('os_update_mode', 'security')) %}
+
+{# targeting (canonical + legacy) #}
+{% set targeting  = ina.get('targeting', {}) %}
+{% set whitelist  = targeting.get('whitelist', ina.get('targets', [])) %}
+{% set blacklist  = targeting.get('blacklist', ina.get('exclude_hosts', [])) %}
+
+{% set HOST       = grains.get('id', '') %}
+{% set OSF        = grains.get('os_family', '') %}
+{% set log_dir    = ina.get('discovery', {}).get('paths', {}).get('log_dir', '/var/log/inanna') %}
+{% set ts         = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set log_file   = log_dir ~ '/inanna_patching_' ~ ts ~ '.log' %}
+{% set log_latest = log_dir ~ '/inanna_patching_latest.log' %}
+
+{# ----------------------------- Safety rails ------------------------------ #}
+{% if ENFORCE and whitelist is not none and not (whitelist is sequence) %}
+{{ salt['test.fail_without_changes']('inanna.targeting.whitelist must be a list') }}
+{% endif %}
+{% if ENFORCE and blacklist is not none and not (blacklist is sequence) %}
+{{ salt['test.fail_without_changes']('inanna.targeting.blacklist must be a list') }}
+{% endif %}
+
+{# ------------------------- Exclusion / Whitelist ------------------------- #}
+{% if HOST in blacklist %}
+patch-os-skip-blacklisted:
+  test.succeed_without_changes:
+    - name: "Host {{ HOST }} is in targeting.blacklist / exclude_hosts. Skipping OS patching."
+
+{% elif whitelist and HOST not in whitelist %}
+patch-os-skip-not-whitelisted:
+  test.succeed_without_changes:
+    - name: "Host {{ HOST }} not in targeting.whitelist / targets. Skipping OS patching."
+
+{% else %}
+
+{# ----------------------------- Log directory ----------------------------- #}
+patch-os-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - user: root
+    - group: root
+    - mode: '0750'
+    - makedirs: True
+
+{# ------------------------- Refresh package metadata ---------------------- #}
+patch-os-refresh:
+  module.run:
+    - name: pkg.refresh_db
+    - require:
+      - file: patch-os-logdir
+
+{# ------------------------------ OS branches ------------------------------ #}
+{# RHEL / RedHat family ---------------------------------------------------- #}
+{% if OSF in ('RedHat', 'Suse') %}
+patch-os-rh-uptodate:
+  pkg.uptodate:
+    - refresh: False
+    {% if update_mode == 'security' %}
+    - security: True
+    {% endif %}
+    - require:
+      - module: patch-os-refresh
+
+patch-os-log:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ ts }}] {{ HOST }}: OS patched ({{ OSF }}; mode={{ update_mode }})"
+    - require:
+      - pkg: patch-os-rh-uptodate
+
+{# Debian / Ubuntu family -------------------------------------------------- #}
+{% elif OSF in ('Debian') %}
+{% if update_mode == 'security' %}
+patch-os-deb-note:
+  test.nop:
+    - comment: "Debian/Ubuntu 'security-only' is not natively supported via pkg.uptodate; applying standard updates."
+{% endif %}
+
+patch-os-deb-uptodate:
+  pkg.uptodate:
+    - refresh: False
+    - require:
+      - module: patch-os-refresh
+      {% if update_mode == 'security' %}
+      - test: patch-os-deb-note
+      {% endif %}
+
+patch-os-log:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ ts }}] {{ HOST }}: OS patched ({{ OSF }}; mode={{ update_mode }})"
+    - require:
+      - pkg: patch-os-deb-uptodate
+
+{# Fallback (other OS families) ------------------------------------------- #}
+{% else %}
+patch-os-generic-uptodate:
+  pkg.uptodate:
+    - refresh: False
+    - require:
+      - module: patch-os-refresh
+
+patch-os-log:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ ts }}] {{ HOST }}: OS patched ({{ OSF or 'UnknownOS' }}; mode={{ update_mode }})"
+    - require:
+      - pkg: patch-os-generic-uptodate
+{% endif %}
+
+{# ---------------------------- Latest log symlink ------------------------- #}
+patch-os-log-latest:
+  file.symlink:
+    - name: {{ log_latest }}
+    - target: {{ log_file }}
+    - force: True
+    - require:
+      - file: patch-os-log
+
+{% endif %}  {# end whitelist/blacklist gate #}

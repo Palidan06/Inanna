@@ -1,0 +1,138 @@
+## inanna/validate.sls
+#
+# Purpose:
+#   Verify that all expected services are running post-patch,
+#   and log results under /var/log/inanna. Optionally enforce start.
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt '*' state.apply inanna.validate
+#
+# Pillar (canonical with legacy fallback):
+#   inanna:
+#     validation:
+#       critical_services:
+#         - sshd
+#         - nginx
+#         - docker
+#       mode: strict        # strict | permissive
+#       enforce_start: false
+#     discovery:
+#       paths:
+#         log_dir: /var/log/inanna
+#   # legacy fallback still supported: inanna:critical_services (list)
+#
+# Logs to:
+#   /var/log/inanna/inanna_validate_YYYYMMDD_HHMM.log
+#   /var/log/inanna/inanna_validate_latest.log
+#   /var/log/inanna/inanna_validate_YYYYMMDD_HHMM.json  (machine-readable)
+
+{# --- Step 1: Read pillar & grains --- #}
+{% set ina        = salt['pillar.get']('inanna', {}) %}
+{% set val        = ina.get('validation', {}) %}
+{% set services   = val.get('critical_services', salt['pillar.get']('inanna:critical_services', [])) %}
+{% set mode       = val.get('mode', 'strict') %}
+{% set ENFORCE    = val.get('enforce_start', False) %}
+{% set DRY        = ina.get('dry_run', False) %}
+{% set HOST       = grains['id'] %}
+{% set ts         = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set now_h      = salt['cmd.run']('date +%Y-%m-%d %H:%M:%S') %}
+{% set log_dir    = ina.get('discovery', {}).get('paths', {}).get('log_dir', '/var/log/inanna') %}
+{% set log_file   = log_dir ~ '/inanna_validate_' ~ ts ~ '.log' %}
+{% set log_latest = log_dir ~ '/inanna_validate_latest.log' %}
+{% set json_file  = log_dir ~ '/inanna_validate_' ~ ts ~ '.json' %}
+
+{# --- Optional type check --- #}
+{% if ina.get('safety', {}).get('enforce_types', True) and (services is string or (services is not iterable)) %}
+{{ salt['test.fail_without_changes']('inanna.validation.critical_services must be a list') }}
+{% endif %}
+
+{# --- Step 1.5: Precompute status for summary/strict mode --- #}
+{% set results = [] %}
+{% for svc in services %}
+  {% set running = salt['service.status'](svc) %}
+  {% do results.append({'name': svc, 'running': running}) %}
+{% endfor %}
+{% set missing = results | selectattr('running', 'equalto', False) | list %}
+
+{# --- Step 2: Ensure log dir --- #}
+validate-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - user: root
+    - group: root
+    - mode: '0750'
+    - makedirs: True
+
+{# --- Step 3: (Optional) Enforce services running (only if enforce_start && not dry-run) --- #}
+{% if ENFORCE and not DRY %}
+{% for svc in services %}
+validate-enforce-{{ svc }}:
+  service.running:
+    - name: {{ svc }}
+    - enable: True
+    - require:
+      - file: validate-logdir
+{% endfor %}
+{% else %}
+validate-enforce-note:
+  test.nop:
+    - comment: "enforce_start={{ ENFORCE }}, dry_run={{ DRY }} — not changing service state"
+    - require:
+      - file: validate-logdir
+{% endif %}
+
+{# --- Step 4: Human-readable log lines per service --- #}
+{% for item in results %}
+validate-log-{{ item.name }}:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ now_h }}] {{ HOST }}: Service {{ item.name }} is {{ 'running' if item.running else 'NOT running' }}"
+    - require:
+      - file: validate-logdir
+      {% if ENFORCE and not DRY %}{% if item.name in services %}- service: validate-enforce-{{ item.name }}{% endif %}{% else %}- test: validate-enforce-note{% endif %}
+{% endfor %}
+
+{# --- Step 5: Machine-readable JSON summary --- #}
+validate-json:
+  file.managed:
+    - name: {{ json_file }}
+    - user: root
+    - group: root
+    - mode: '0640'
+    - contents: |
+        {{ {
+          'host': HOST,
+          'timestamp': now_h,
+          'mode': mode,
+          'enforce_start': ENFORCE,
+          'services': results
+        } | tojson }}
+    - require:
+      - file: validate-logdir
+
+{# --- Step 6: Stable latest symlink --- #}
+validate-log-latest:
+  file.symlink:
+    - name: {{ log_latest }}
+    - target: {{ log_file }}
+    - force: True
+    - require:
+      - file: validate-log-{{ results[-1]['name'] if results else 'noop' }}
+
+{# --- Step 7: Strict/permissive outcome --- #}
+{% if mode == 'strict' and (missing | length) > 0 %}
+validate-strict-fail:
+  test.fail_without_changes:
+    - name: "Missing or stopped services: {{ (missing | map(attribute='name') | list) | join(', ') }}"
+    - require:
+      - file: validate-json
+{% else %}
+validate-{{ 'strict' if mode == 'strict' else 'permissive' }}-pass:
+  test.succeed_without_changes:
+    - name: "Validation {{ 'passed' if (missing | length) == 0 else 'completed with non-running services (permissive)' }}."
+    - require:
+      - file: validate-json
+{% endif %}

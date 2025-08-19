@@ -1,0 +1,124 @@
+## pillar/inanna.sls
+#
+# Purpose:
+#   Central configuration values for the Inanna automation framework.
+#   Consumed by all Inanna state modules via pillar.get('inanna', {}).
+#
+# Notes:
+#   - Keys are grouped by domain (execution, patching, discovery, targeting, etc.)
+#   - Types are explicit; lists stay lists, booleans are bools (no strings).
+#   - Security: avoid committing real secrets. Use a secret store or external pillar.
+#   - Compatibility: states should prefer `update_mode` and only fall back to
+#     `os_update_mode` to support legacy usage.
+#
+# Quick tips:
+#   - For one-off runs, override at the CLI instead of editing this file:
+#     salt \* state.apply inanna.init pillar='{"inanna": {"dry_run": false, "update_mode": "security"}}'
+#   - Standardized filename is patch_apps.sls (plural).
+
+inanna:
+  ###########################################################################
+  # 1) Execution flags
+  ###########################################################################
+  dry_run: false              # PRODUCTION DEFAULT: False. Use CLI overrides for testing.
+  skip_snapshot: false        # If true, skip snapshot stage entirely.
+  auto_reboot: true           # If true, allow reboot.sls to reboot when patches changed.
+
+  ###########################################################################
+  # 2) Patching mode
+  ###########################################################################
+  # Preferred modern key; states should read this first.
+  update_mode: security       # 'security' | 'all'
+  # Legacy key maintained for backward-compat (kept in sync with update_mode).
+  os_update_mode: security
+
+  ###########################################################################
+  # 3) Discovery
+  ###########################################################################
+  discovery:
+    # Use plural key name to match states: discover.sls expects 'scan_ranges'.
+    scan_ranges:
+      - '192.168.1.0/24'
+      # - '192.168.2.0/24'
+      # - '192.168.3.0/24'
+
+    # Behavior toggles
+    overwrite_reports: false                                        # true = regenerate discovery reports each run
+    install_nmap: true                                              # auto-install nmap if missing
+    probe_ports: true                                               # TCP probe to identify agentless candidates
+    port_list: [22, 5985, 3389]                                     # SSH, WinRM, RDP
+
+    # Paths used by discover/logging (states should use defaults if absent)
+    paths:
+      log_dir: /var/log/inanna
+      # Symlink 'latest' creation is recommended in states for convenience
+      discovery_glob: '/var/log/inanna/inanna_alive_mgmt_*.txt'
+
+  ###########################################################################
+  # 4) Targeting
+  ###########################################################################
+  targeting:
+    whitelist:                                                      # Limit actions to these if non-empty (IPs, FQDNs, IDs)
+      - 192.168.1.10
+      - 192.168.1.11
+    blacklist:                                                      # Never touch these
+      - 192.168.1.50
+
+  ###########################################################################
+  # 5) Salt-SSH integration (optional)
+  ###########################################################################
+  ssh:
+    targets: []                                                     # e.g., ['web01', 'db01'] if grains['id'] matches
+    roster:
+      output_path: /etc/salt/roster                                 # where generated roster entries are written
+      overwrite: false                                              # true = replace whole file; false = blockreplace
+      default_user: ec2-user                                        # SSH username for managed hosts
+      use_sudo: true                                                # run commands with sudo (assumes NOPASSWD)
+      ssh_port: 22                                                  # SSH port
+      priv_key: /root/.ssh/id_rsa                                   # private key path on the controller
+      name_prefix: 'sshhost-'                                       # prefix for generated roster IDs
+      candidates_glob: '/var/log/inanna/inanna_alive_mgmt_*.txt'    # discover TCP results
+
+  ###########################################################################
+  # 6) VMware (snapshots + cleanup)  — use external pillar for real secrets
+  ###########################################################################
+  vmware:
+    host: "vcenter.yourdomain.local"
+    user: "administrator@vsphere.local"
+    password: "REPLACE_ME_IN_SECRET_STORE"  # <-- DO NOT COMMIT REAL PASSWORDS
+    protocol: "https"
+    port: 443
+
+  # VM names to snapshot (must match vCenter/ESXi inventory names)
+  vm_names:
+    - LabHost1
+    - LabHost2
+
+  ###########################################################################
+  # 7) Validation
+  ###########################################################################
+  validation:
+    # Services to verify after patching (validate.sls)
+    critical_services:
+      - sshd
+      - nginx
+      - netbox
+      # add real services here
+    # Behavior: "strict" fails if any service is absent or stopped.
+    # "permissive" only fails on services that exist but are stopped.
+    mode: strict
+
+  ###########################################################################
+  # 8) Cleanup
+  ###########################################################################
+  cleanup:
+    retention_days: 30                                                        # Keep newest artifacts; prune older ones safely.
+
+  ###########################################################################
+  # 9) Advanced / safety rails (optional)
+  ###########################################################################
+  safety:
+    # If true, states should assert types for key inputs and fail fast on mismatch.
+    enforce_types: true
+    # Hard path guards for cleanup to prevent accidental wide deletes.
+    allowed_log_root: /var/log/inanna

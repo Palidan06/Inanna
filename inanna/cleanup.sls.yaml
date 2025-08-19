@@ -1,0 +1,189 @@
+## inanna/cleanup.sls
+#
+# Purpose:
+#   Remove old VM snapshots, temporary marker files, and stale logs
+#   after successful patching and validation.
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt '*' state.apply inanna.cleanup
+#
+# Pillar (canonical with legacy fallback):
+#   inanna:
+#     cleanup:
+#       retention_days: 30                # days to keep snapshots/logs
+#     vmware:
+#       host: <vCenter or ESXi hostname>
+#       user: <username>
+#       password: <password>
+#       protocol: https
+#       port: 443
+#     vm_names:
+#       - <VM name 1>
+#       - <VM name 2>
+#     discovery:
+#       paths:
+#         log_dir: /var/log/inanna
+#     safety:
+#       allowed_log_root: /var/log/inanna
+#   # legacy: cleanup_retention_days (int)
+#
+# Logs to:
+#   /var/log/inanna/inanna_cleanup_YYYYMMDD_HHMM.log
+#   /var/log/inanna/inanna_cleanup_latest.log
+
+{# --- Step 1: Read pillar config & grains --- #}
+{% set ina            = salt['pillar.get']('inanna', {}) %}
+{% set cleanup        = ina.get('cleanup', {}) %}
+{% set retention      = cleanup.get('retention_days', ina.get('cleanup_retention_days', 30)) %}
+{% set vmw            = ina.get('vmware', {}) %}
+{% set vms            = ina.get('vm_names', []) %}
+{% set HOST           = grains['id'] %}
+{% set DRY            = ina.get('dry_run', False) %}
+{% set log_dir        = ina.get('discovery', {}).get('paths', {}).get('log_dir', '/var/log/inanna') %}
+{% set ts             = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set now_h          = salt['cmd.run']('date +%Y-%m-%d %H:%M:%S') %}
+{% set cleanup_log    = log_dir ~ '/inanna_cleanup_' ~ ts ~ '.log' %}
+{% set cleanup_latest = log_dir ~ '/inanna_cleanup_latest.log' %}
+
+{# Safety rails: restrict deletions within allowed root -------------------- #}
+{% set allowed_root = ina.get('safety', {}).get('allowed_log_root', '/var/log/inanna') %}
+{% if not log_dir.startswith(allowed_root) %}
+cleanup-guard-fail:
+  test.fail_without_changes:
+    - name: "Refusing cleanup: log_dir={{ log_dir }} is outside allowed_log_root={{ allowed_root }}"
+{% else %}
+
+{# --- Step 2: Ensure log dir and write start banner --- #}
+cleanup-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - user: root
+    - group: root
+    - mode: '0750'
+    - makedirs: True
+
+cleanup-start-log:
+  file.append:
+    - name: {{ cleanup_log }}
+    - text: "[{{ now_h }}] {{ HOST }}: Cleanup start (retention={{ retention }} days)"
+    - require:
+      - file: cleanup-logdir
+
+{# --- Step 3: VMware snapshot pruning (best-effort, by prefix+age) ------- #}
+{% set prefix = ina.get('snapshot', {}).get('name_prefix', 'inanna_prepatch_') %}
+{% set cutoff = (salt['cmd.run']('date +%s') | int) - (retention * 86400) %}
+
+{% if vms %}
+  {% for vm in vms %}
+    {# NOTE: This call happens at render-time, matching your previous approach. #}
+    {% set snaps = salt['vmware.vm_snapshot_list'](
+          vm_name=vm,
+          hostname=vmw.get('host'),
+          username=vmw.get('user'),
+          password=vmw.get('password'),
+          protocol=vmw.get('protocol'),
+          port=vmw.get('port')
+        ).get('snapshots', []) %}
+    {% for snap in snaps %}
+      {% if snap.name.startswith(prefix) and (snap.createTime | int) < cutoff %}
+        {% if DRY %}
+cleanup-snap-dry-{{ vm | replace(' ', '_') }}-{{ loop.index }}:
+  test.succeed_without_changes:
+    - name: "[DRY-RUN] Would delete snapshot '{{ snap.name }}' on VM {{ vm }}"
+    - require:
+      - file: cleanup-start-log
+cleanup-log-snap-dry-{{ vm | replace(' ', '_') }}-{{ loop.index }}:
+  file.append:
+    - name: {{ cleanup_log }}
+    - text: "[{{ now_h }}] {{ HOST }}: [DRY-RUN] Would delete VM snapshot '{{ snap.name }}' (VM={{ vm }})"
+    - require:
+      - test: cleanup-snap-dry-{{ vm | replace(' ', '_') }}-{{ loop.index }}
+        {% else %}
+cleanup-snap-{{ vm | replace(' ', '_') }}-{{ loop.index }}:
+  vmware.vm_snapshot_delete:
+    - vm_name: {{ vm }}
+    - snapshot_name: {{ snap.name }}
+    - hostname: {{ vmw.get('host') }}
+    - username: {{ vmw.get('user') }}
+    - password: {{ vmw.get('password') }}
+    - protocol: {{ vmw.get('protocol') }}
+    - port: {{ vmw.get('port') }}
+    - require:
+      - file: cleanup-start-log
+cleanup-log-snap-{{ vm | replace(' ', '_') }}-{{ loop.index }}:
+  file.append:
+    - name: {{ cleanup_log }}
+    - text: "[{{ now_h }}] {{ HOST }}: Deleted VM snapshot '{{ snap.name }}' (VM={{ vm }})"
+    - require:
+      - vmware: cleanup-snap-{{ vm | replace(' ', '_') }}-{{ loop.index }}
+        {% endif %}
+      {% endif %}
+    {% endfor %}
+  {% endfor %}
+{% else %}
+cleanup-snap-note-novms:
+  test.nop:
+    - comment: "No VMs defined under inanna.vm_names — snapshot pruning skipped."
+    - require:
+      - file: cleanup-start-log
+{% endif %}
+
+{# --- Step 4: (Deprecated) remove local snapshot marker if present ------- #}
+cleanup-old-marker:
+  file.absent:
+    - name: /var/tmp/inanna_snapshot_{{ HOST }}.txt
+    - require:
+      - file: cleanup-start-log
+
+{# --- Step 5: Prune old logs & reports under {{ log_dir }} --------------- #}
+{# We delete only regular files (not symlinks) older than retention. #}
+{% set patterns = [
+  'inanna_*_*.log',
+  'inanna_*_*.json',
+  'inanna_alive_*_*.txt',
+  'inanna_discover_*_*.txt'
+] %}
+
+{% for pat in patterns %}
+  {% set old_files = salt['file.find'](log_dir, type='f', name=pat, age=retention ~ 'd') %}
+  {% for f in old_files %}
+cleanup-old-{{ loop.index0 }}-{{ loop.parentloop.index0 }}:
+  file.absent:
+    - name: {{ f }}
+    - require:
+      - file: cleanup-start-log
+  {% endfor %}
+{% endfor %}
+
+{# Back-compat: remove old single-file logs if they exist (once) ---------- #}
+cleanup-old-flat-logs:
+  cmd.run:
+    - name: >
+        bash -c "
+        for p in /var/log/inanna_patching.log /var/log/inanna_cleanup.log /var/log/inanna_validation.log; do
+          [ -f \"$p\" ] && rm -f \"$p\" || true;
+        done"
+    - shell: /bin/bash
+    - require:
+      - file: cleanup-start-log
+
+{# --- Step 6: Final log + stable latest symlink -------------------------- #}
+cleanup-done-log:
+  file.append:
+    - name: {{ cleanup_log }}
+    - text: "[{{ now_h }}] {{ HOST }}: Cleanup complete (retention={{ retention }} days)"
+    - require:
+      - {{ 'test: cleanup-snap-note-novms' if not vms else 'file: cleanup-start-log' }}
+
+cleanup-log-latest:
+  file.symlink:
+    - name: {{ cleanup_latest }}
+    - target: {{ cleanup_log }}
+    - force: True
+    - require:
+      - file: cleanup-done-log
+
+{% endif %}  {# end allowed_root guard #}

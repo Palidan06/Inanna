@@ -1,0 +1,191 @@
+## inanna/patch_apps.sls
+#
+# Purpose:
+#   Apply updates or patches to installed applications and services (non-OS baseline).
+#   Respects dry_run, host targeting, and logs all actions to /var/log/inanna.
+#   (OS baseline updates live in patch_os.sls; snapshot gating is handled by init.sls.)
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt '*' state.apply inanna.patch_apps
+#
+# Pillar (canonical with legacy fallbacks):
+#   inanna:
+#     dry_run: true|false
+#     targeting:
+#       whitelist: [host1, host2]     # optional: only patch these if non-empty  (legacy: targets)
+#       blacklist: [hostX]            # never patch these                      (legacy: exclude_hosts)
+#     discovery:
+#       paths:
+#         log_dir: /var/log/inanna
+#     apps:
+#       pkgs:
+#         RedHat:
+#           - git
+#           - vim-enhanced
+#         Debian:
+#           - git
+#           - vim
+#       snaps:
+#         - code
+#       restart_services:
+#         - nginx
+#
+# Logs to:
+#   /var/log/inanna/inanna_apps_YYYYMMDD_HHMM.log
+#   /var/log/inanna/inanna_apps_latest.log
+
+{# ----------------------------- Pillar & vars ----------------------------- #}
+{% set ina           = salt['pillar.get']('inanna', {}) %}
+{% set DRY           = ina.get('dry_run', False) %}
+
+{# Targeting (canonical + legacy) #}
+{% set targeting     = ina.get('targeting', {}) %}
+{% set whitelist     = targeting.get('whitelist', ina.get('targets', [])) %}
+{% set blacklist     = targeting.get('blacklist', ina.get('exclude_hosts', [])) %}
+
+{# App config #}
+{% set apps          = ina.get('apps', {}) %}
+{% set pkgs_osmap    = apps.get('pkgs', {}) %}
+{% set snaps_list    = apps.get('snaps', []) %}
+{% set restart_svcs  = apps.get('restart_services', []) %}
+
+{# Host/grains & logging #}
+{% set HOST          = grains.get('id', '') %}
+{% set OSF           = grains.get('os_family', '') %}
+{% set log_dir       = ina.get('discovery', {}).get('paths', {}).get('log_dir', '/var/log/inanna') %}
+{% set ts            = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set log_file      = log_dir ~ '/inanna_apps_' ~ ts ~ '.log' %}
+{% set log_latest    = log_dir ~ '/inanna_apps_latest.log' %}
+
+{# Safety rails #}
+{% set ENFORCE       = ina.get('safety', {}).get('enforce_types', True) %}
+{% if ENFORCE and whitelist is not none and not (whitelist is sequence) %}
+{{ salt['test.fail_without_changes']('inanna.targeting.whitelist must be a list') }}
+{% endif %}
+{% if ENFORCE and blacklist is not none and not (blacklist is sequence) %}
+{{ salt['test.fail_without_changes']('inanna.targeting.blacklist must be a list') }}
+{% endif %}
+
+{# ------------------------- Exclusion / Whitelist ------------------------- #}
+{% if HOST in blacklist %}
+patch-apps-skip-blacklisted:
+  test.succeed_without_changes:
+    - name: "Host {{ HOST }} is in targeting.blacklist / exclude_hosts. Skipping application patching."
+
+{% elif whitelist and HOST not in whitelist %}
+patch-apps-skip-not-whitelisted:
+  test.succeed_without_changes:
+    - name: "Host {{ HOST }} not in targeting.whitelist / targets. Skipping application patching."
+
+{% else %}
+
+{# ------------------------------ Log directory ---------------------------- #}
+patch-apps-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - user: root
+    - group: root
+    - mode: '0750'
+    - makedirs: True
+
+{# -------------------------- Package selection ---------------------------- #}
+{% set pkgs = pkgs_osmap.get(OSF, []) %}
+{% if ENFORCE and pkgs and not (pkgs is sequence) %}
+{{ salt['test.fail_without_changes']('inanna.apps.pkgs.' ~ OSF ~ ' must be a list of package names') }}
+{% endif %}
+
+{# ------------------------- Refresh package metadata ---------------------- #}
+patch-apps-refresh:
+  module.run:
+    - name: pkg.refresh_db
+    - require:
+      - file: patch-apps-logdir
+
+{# --------------------------- Update application pkgs --------------------- #}
+{% if pkgs %}
+patch-apps-pkgs-latest:
+  pkg.latest:
+    - pkgs: {{ pkgs | tojson }}
+    - require:
+      - module: patch-apps-refresh
+
+patch-apps-log-pkgs:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ ts }}] {{ HOST }}: updated app packages ({{ OSF }}): {{ pkgs | join(', ') }}"
+    - require:
+      - pkg: patch-apps-pkgs-latest
+{% else %}
+patch-apps-no-pkgs:
+  test.succeed_without_changes:
+    - name: "No application packages defined for OS family {{ OSF }} (inanna.apps.pkgs.{{ OSF }})."
+    - require:
+      - module: patch-apps-refresh
+{% endif %}
+
+{# -------------------------- Optional: snap refresh ----------------------- #}
+{% if snaps_list %}
+patch-apps-snap-note:
+  test.nop:
+    - comment: "Attempting snap refresh for: {{ snaps_list | join(', ') }} (only if snap is present)."
+    - require:
+      - file: patch-apps-logdir
+
+{% for snapname in snaps_list %}
+patch-apps-snap-{{ snapname }}:
+  cmd.run:
+    - name: "snap refresh {{ snapname }}"
+    - shell: /bin/bash
+    - onlyif:
+      - command -v snap >/dev/null 2>&1
+      - snap list {{ snapname }} >/dev/null 2>&1
+    - require:
+      - test: patch-apps-snap-note
+{% endfor %}
+
+patch-apps-log-snaps:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ ts }}] {{ HOST }}: snap refresh attempted for: {{ snaps_list | join(', ') }}"
+    - require:
+      {% if snaps_list %}
+      - cmd: patch-apps-snap-{{ snaps_list[-1] }}
+      {% else %}
+      - test: patch-apps-snap-note
+      {% endif %}
+{% endif %}
+
+{# -------------------- Optional: restart services on change --------------- #}
+{% if restart_svcs %}
+{% for svc in restart_svcs %}
+patch-apps-svc-{{ svc }}:
+  service.running:
+    - name: {{ svc }}
+    - enable: True
+    - watch:
+      {% if pkgs %}- pkg: patch-apps-pkgs-latest{% endif %}
+    - require:
+      - file: patch-apps-logdir
+{% endfor %}
+
+patch-apps-log-svcs:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ ts }}] {{ HOST }}: ensured/restarted services: {{ restart_svcs | join(', ') }}"
+    - require:
+      - service: patch-apps-svc-{{ restart_svcs[-1] }}
+{% endif %}
+
+{# ---------------------------- Latest log symlink ------------------------- #}
+patch-apps-log-latest:
+  file.symlink:
+    - name: {{ log_latest }}
+    - target: {{ log_file }}
+    - force: True
+    - require:
+      - file: {{ 'patch-apps-log-pkgs' if pkgs else 'patch-apps-no-pkgs' }}
+
+{% endif %}  {# end whitelist/blacklist gate #}

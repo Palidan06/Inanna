@@ -1,0 +1,34 @@
+## pillar/top.sls
+#
+# Purpose:
+#   Maps pillar data (e.g., inanna.sls) to target minions (and salt-ssh targets
+#   if the master renders pillar for them). Required for pillar.get to work inside
+#   state modules.
+#
+# Structure:
+#   base:
+#     '*':
+#       - inanna
+#
+# Notes:
+#   - Keep this broad until you introduce per-environment or per-role splits.
+#   - If you use salt-ssh, ensure the controller can render pillar for those targets
+#     (or gate logic in states).
+#   - Consider narrowing targets later (e.g., by grain/nodegroup) once stable.
+
+base:
+  '*':
+    - inanna
+
+# Example: selective targeting by grain (uncomment and adapt)
+# base:
+#   'G@role:inanna-managed':
+#     - inanna
+
+# Example: multiple envs (prod/dev) — keep in mind pillar_roots in master config
+# prod:
+#   'G@env:prod':
+#     - inanna
+# dev:
+#   'G@env:dev':
+#     - inanna

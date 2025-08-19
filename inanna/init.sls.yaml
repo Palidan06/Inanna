@@ -1,0 +1,158 @@
+## inanna/init.sls
+#
+# Purpose:
+#   Main entry point for Inanna.
+#   Applies discovery, optional roster build, snapshots (when applicable),
+#   patching, optional reboot, validation, and cleanup in sequence.
+#
+# Usage:
+#   salt '*' state.apply inanna.init
+#   salt-ssh '*' state.apply inanna.init --roster=/etc/salt/roster
+#
+# Stages (deterministic order):
+#   1) discover        (always)
+#   2) roster_build    (optional via pillar)
+#   3) snapshot        (guarded: skip_snapshot)
+#   4) patch_os
+#   5) patch_apps      (standardized filename: patch_apps.sls)
+#   6) reboot          (guarded: auto_reboot)
+#   7) validate
+#   8) cleanup
+#
+# Pillar keys (canonical, with legacy fallbacks):
+#   inanna:
+#     dry_run: bool                          (default false in prod)
+#     skip_snapshot: bool                    (guard snapshots)
+#     auto_reboot: bool                      (guard reboots)
+#     discovery.scan_ranges: list[str]       (used by discover.sls)
+#     targeting.whitelist: list[str]         (optional; used by child states)
+#     targeting.blacklist: list[str]         (exclusions; legacy: exclude_hosts)
+#     ssh.targets: list[str]                 (legacy: ssh_targets)
+#     ssh.roster.auto_build: bool            (legacy: roster.auto_build)
+#     validation.mode: strict|permissive     (used by validate.sls)
+#     cleanup.retention_days: int            (used by cleanup.sls)
+#
+# Notes:
+#   - We explicitly call child SLS files using module.run state.apply to ensure order.
+#   - Child SLS files remain idempotent; re-runs should be no-ops when nothing changes.
+#   - Secrets must live in external pillar/secret store; do not commit real creds.
+
+{# ----------------------------- Jinja inputs ------------------------------ #}
+{% set _inanna        = salt['pillar.get']('inanna', {}) %}
+{% set DRY            = _inanna.get('dry_run', False) %}
+{% set SKIP_SNAPSHOT  = _inanna.get('skip_snapshot', False) %}
+{% set AUTO_REBOOT    = _inanna.get('auto_reboot', True) %}
+
+{# Legacy → Canonical fallbacks for targeting/ssh/roster ------------------- #}
+{% set targeting      = _inanna.get('targeting', {}) %}
+{% set blacklist      = targeting.get('blacklist', _inanna.get('exclude_hosts', [])) %}
+{% set ssh_cfg        = _inanna.get('ssh', {}) %}
+{% set ssh_targets    = ssh_cfg.get('targets', _inanna.get('ssh_targets', [])) %}
+{% set roster         = ssh_cfg.get('roster', _inanna.get('roster', {})) %}
+{% set ROSTER_AUTO    = roster.get('auto_build', False) %}
+
+{% set HOSTNAME       = grains.get('id', '') %}
+{% set IS_SSH_HOST    = HOSTNAME in ssh_targets %}
+
+{# --------------------------- Exclusion short-circuit --------------------- #}
+{% if HOSTNAME in blacklist %}
+skip_inanna_excluded:
+  test.succeed_without_changes:
+    - name: "Host {{ HOSTNAME }} is excluded from Inanna (targeting.blacklist / exclude_hosts). Skipping all steps."
+{% else %}
+
+{# ------------------------------- 1) Discover ----------------------------- #}
+inanna-discover:
+  module.run:
+    - name: state.apply
+    - mods: inanna.discover
+    - test: {{ DRY }}
+
+{# ------------------------- 2) Optional roster build ---------------------- #}
+{% if ROSTER_AUTO %}
+inanna-roster-build:
+  module.run:
+    - name: state.apply
+    - mods: inanna.roster_build
+    - test: {{ DRY }}
+    - require:
+      - module: inanna-discover
+{% else %}
+inanna-roster-build-skip:
+  test.nop:
+    - comment: "Roster build skipped (ssh.roster.auto_build=false)"
+    - require:
+      - module: inanna-discover
+{% endif %}
+
+{# --------------------------- 3) Snapshot (guarded) ----------------------- #}
+{% if not SKIP_SNAPSHOT and not IS_SSH_HOST %}
+inanna-snapshot:
+  module.run:
+    - name: state.apply
+    - mods: inanna.snapshot
+    - test: {{ DRY }}
+    - require:
+      - module: {{ 'inanna-roster-build' if ROSTER_AUTO else 'inanna-roster-build-skip' }}
+{% else %}
+inanna-snapshot-skip:
+  test.nop:
+    - comment: "Snapshots skipped (skip_snapshot={{ SKIP_SNAPSHOT }} or this host is managed via salt-ssh={{ IS_SSH_HOST }})"
+    - require:
+      - module: {{ 'inanna-roster-build' if ROSTER_AUTO else 'inanna-roster-build-skip' }}
+{% endif %}
+
+{# -------------------------- 4) Patch OS (always) ------------------------- #}
+inanna-patch-os:
+  module.run:
+    - name: state.apply
+    - mods: inanna.patch_os
+    - test: {{ DRY }}
+    - require:
+      - module: {{ 'inanna-snapshot' if (not SKIP_SNAPSHOT and not IS_SSH_HOST) else 'inanna-snapshot-skip' }}
+
+{# --------------------- 5) Patch Apps (standard name) --------------------- #}
+inanna-patch-apps:
+  module.run:
+    - name: state.apply
+    - mods: inanna.patch_apps
+    - test: {{ DRY }}
+    - require:
+      - module: inanna-patch-os
+
+{# ------------------------- 6) Reboot (guarded) --------------------------- #}
+{% if AUTO_REBOOT %}
+inanna-reboot:
+  module.run:
+    - name: state.apply
+    - mods: inanna.reboot
+    - test: {{ DRY }}
+    - require:
+      - module: inanna-patch-apps
+{% else %}
+inanna-reboot-skip:
+  test.nop:
+    - comment: "Reboot skipped (auto_reboot=false)"
+    - require:
+      - module: inanna-patch-apps
+{% endif %}
+
+{# ------------------------------ 7) Validate ------------------------------ #}
+inanna-validate:
+  module.run:
+    - name: state.apply
+    - mods: inanna.validate
+    - test: {{ DRY }}
+    - require:
+      - module: {{ 'inanna-reboot' if AUTO_REBOOT else 'inanna-reboot-skip' }}
+
+{# ------------------------------- 8) Cleanup ------------------------------ #}
+inanna-cleanup:
+  module.run:
+    - name: state.apply
+    - mods: inanna.cleanup
+    - test: {{ DRY }}
+    - require:
+      - module: inanna-validate
+
+{% endif %}

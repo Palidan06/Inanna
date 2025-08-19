@@ -1,0 +1,94 @@
+## inanna/reboot.sls
+#
+# Purpose:
+#   Reboot the host automatically if configured to do so.
+#
+# Called by:
+#   - inanna/init.sls
+#
+# Usage:
+#   salt '*' state.apply inanna.reboot
+#
+# Pillar Dependencies:
+#   inanna:
+#     auto_reboot: true|false     # Canonical default in prod: true (can override per-run)
+#     dry_run: true|false         # If true, simulate (do not actually reboot)
+#     discovery:
+#       paths:
+#         log_dir: /var/log/inanna
+#
+# Logs to:
+#   /var/log/inanna/inanna_reboot_YYYYMMDD_HHMM.log
+#   /var/log/inanna/inanna_reboot_latest.log
+
+{# --- Step 1: Read pillar & grains --- #}
+{% set ina         = salt['pillar.get']('inanna', {}) %}
+{% set auto_reboot = ina.get('auto_reboot', True) %}
+{% set DRY         = ina.get('dry_run', False) %}
+{% set HOST        = grains['id'] %}
+{% set log_dir     = ina.get('discovery', {}).get('paths', {}).get('log_dir', '/var/log/inanna') %}
+{% set ts          = salt['cmd.run']('date +%Y%m%d_%H%M') %}
+{% set now_h       = salt['cmd.run']('date +%Y-%m-%d %H:%M:%S') %}
+{% set log_file    = log_dir ~ '/inanna_reboot_' ~ ts ~ '.log' %}
+{% set log_latest  = log_dir ~ '/inanna_reboot_latest.log' %}
+
+{# --- Step 2: Ensure log directory --- #}
+inanna-reboot-logdir:
+  file.directory:
+    - name: {{ log_dir }}
+    - user: root
+    - group: root
+    - mode: '0750'
+    - makedirs: True
+
+{# --- Step 3: Conditional reboot (dry-run aware) --- #}
+{% if auto_reboot %}
+{% if DRY %}
+reboot-host-dry-run:
+  test.succeed_without_changes:
+    - name: "[Dry Run] Would trigger reboot on {{ HOST }} in ~5 seconds"
+
+reboot-log-dry:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ now_h }}] {{ HOST }}: [DRY-RUN] Reboot would have been triggered by Inanna"
+    - require:
+      - test: reboot-host-dry-run
+{% else %}
+reboot-host:
+  module.run:
+    - name: system.reboot
+    - in_seconds: 5
+    - message: "Inanna automated reboot"
+    - require:
+      - file: inanna-reboot-logdir
+
+reboot-log:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ now_h }}] {{ HOST }}: Reboot triggered by Inanna"
+    - require:
+      - module: reboot-host
+{% endif %}
+
+{% else %}
+reboot-skip:
+  test.succeed_without_changes:
+    - name: "auto_reboot is false; skipping reboot for {{ HOST }}"
+
+reboot-log-skip:
+  file.append:
+    - name: {{ log_file }}
+    - text: "[{{ now_h }}] {{ HOST }}: Reboot skipped (auto_reboot=false)"
+    - require:
+      - test: reboot-skip
+{% endif %}
+
+{# --- Step 4: Stable latest symlink --- #}
+reboot-log-latest:
+  file.symlink:
+    - name: {{ log_latest }}
+    - target: {{ log_file }}
+    - force: True
+    - require:
+      - file: {{ 'reboot-log' if (auto_reboot and not DRY) else ('reboot-log-dry' if (auto_reboot and DRY) else 'reboot-log-skip') }}
